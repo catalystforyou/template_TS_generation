@@ -4,6 +4,8 @@ from itertools import combinations
 from copy import deepcopy
 from scipy.spatial import Delaunay
 from tqdm import trange
+import os
+import subprocess
 
 
 def read_gjf(filename): # read gjf file and return a rdkit mol object
@@ -304,10 +306,152 @@ def gen_a_combination(sh, radical_orig, reflex=False):
         f.write(f'  atoms:{free_radical_idx+1},{s_index+len(radical_rotated.GetAtoms())+1},{h_index+len(radical_rotated.GetAtoms())+1}\n')
         f.write('$end\n')
     
+def mol_to_gaussian_input(mol_file, gaussian_input_file, functional="B3LYP-D3(BJ)", basis_set="6-31G(d)", multiplicity=2):
+    # 读取MOL文件
+    mol = Chem.MolFromMolFile(mol_file)
+    if mol is None:
+        raise ValueError("无法读取MOL文件")
+
+    # 获取分子名称
+    mol_name = mol.GetProp("_Name") if mol.HasProp("_Name") else "Molecule"
+
+    # 获取原子符号和坐标
+    atoms = mol.GetAtoms()
+    conf = mol.GetConformer()
+    atom_coords = [(atom.GetSymbol(), conf.GetAtomPosition(atom.GetIdx())) for atom in atoms]
+
+    # 写入Gaussian输入文件
+    with open(gaussian_input_file, 'w') as f:
+        f.write(f"%NProcShared=32\n")
+        f.write(f"%Mem=112GB\n")
+        f.write(f"# opt=(calcfc,ts,noeigentest) freq b3lyp/6-31G(d) 5d em=gd3bj\n\n")
+        f.write(f"{mol_name}\n\n")
+        f.write(f"0 {multiplicity}\n")  # 假设总电荷为0，多重度为2
+        for symbol, coord in atom_coords:
+            f.write(f"{symbol}    {coord.x:.6f}    {coord.y:.6f}    {coord.z:.6f}\n")
+        f.write("\n")
+
+def run_gaussian(gaussian_input_file, gaussian_output_file):
+    # 调用Gaussian程序并等待其完成
+    result = subprocess.run(["g16", gaussian_input_file], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Gaussian Failed: {result.stderr}")
+
+    # 将Gaussian输出重定向到指定的输出文件
+    with open(gaussian_output_file, 'w') as f:
+        f.write(result.stdout)
+
+def gaussian_to_orca_input(gaussian_output_file, orca_input_file):
+    # 解析Gaussian输出文件，提取优化后的几何结构
+    with open(gaussian_output_file, 'r') as f:
+        lines = f.readlines()
+
+    # 查找优化后的几何结构
+    start_idx = None
+    end_idx = None
+    for i, line in enumerate(lines):
+        if "Standard orientation:" in line:
+            start_idx = i + 5
+        elif start_idx and "---------------------------------------------------------------------" in line and i > start_idx:
+            end_idx = i
+            break
+
+    if start_idx is None or end_idx is None:
+        raise ValueError("无法在Gaussian输出文件中找到优化后的几何结构")
+
+    # 提取优化后的几何结构
+    atomic_number_to_symbol_map = {
+    1: "H", 2: "He", 3: "Li", 4: "Be", 5: "B", 6: "C", 7: "N", 8: "O", 9: "F", 10: "Ne",
+    11: "Na", 12: "Mg", 13: "Al", 14: "Si", 15: "P", 16: "S", 17: "Cl", 18: "Ar", 19: "K", 20: "Ca",
+    21: "Sc", 22: "Ti", 23: "V", 24: "Cr", 25: "Mn", 26: "Fe", 27: "Co", 28: "Ni", 29: "Cu", 30: "Zn",
+    31: "Ga", 32: "Ge", 33: "As", 34: "Se", 35: "Br", 36: "Kr", 37: "Rb", 38: "Sr", 39: "Y", 40: "Zr",
+    41: "Nb", 42: "Mo", 43: "Tc", 44: "Ru", 45: "Rh", 46: "Pd", 47: "Ag", 48: "Cd", 49: "In", 50: "Sn",
+    51: "Sb", 52: "Te", 53: "I", 54: "Xe", 55: "Cs", 56: "Ba", 57: "La", 58: "Ce", 59: "Pr", 60: "Nd",
+    61: "Pm", 62: "Sm", 63: "Eu", 64: "Gd", 65: "Tb", 66: "Dy", 67: "Ho", 68: "Er", 69: "Tm", 70: "Yb",
+    71: "Lu", 72: "Hf", 73: "Ta", 74: "W", 75: "Re", 76: "Os", 77: "Ir", 78: "Pt", 79: "Au", 80: "Hg",
+    81: "Tl", 82: "Pb", 83: "Bi", 84: "Po", 85: "At", 86: "Rn", 87: "Fr", 88: "Ra", 89: "Ac", 90: "Th",
+    91: "Pa", 92: "U", 93: "Np", 94: "Pu", 95: "Am", 96: "Cm", 97: "Bk", 98: "Cf", 99: "Es", 100: "Fm",
+    101: "Md", 102: "No", 103: "Lr", 104: "Rf", 105: "Db", 106: "Sg", 107: "Bh", 108: "Hs", 109: "Mt",
+    110: "Ds", 111: "Rg", 112: "Cn", 113: "Nh", 114: "Fl", 115: "Mc", 116: "Lv", 117: "Ts", 118: "Og"
+    }   
+    geometry = []
+    for line in lines[start_idx:end_idx]:
+        parts = line.split()
+        atom_symbol = parts[1]
+        x, y, z = float(parts[3]), float(parts[4]), float(parts[5])
+        geometry.append((atomic_number_to_symbol_map[int(atom_symbol)], x, y, z))
+    print(geometry, start_idx, end_idx)
+
+    # 写入ORCA输入文件
+    with open(orca_input_file, 'w') as f:
+        f.write("! m062x RIJCOSX def2-TZVPP autoaux verytightSCF noautostart miniprint nopop\n")
+        f.write("%maxcore  3500\n")
+        f.write("%pal nprocs  32 end\n")
+        f.write("%\cpcm\n")
+        f.write("smd true\n")
+        f.write('SMDsolvent "MeCN"\n')
+        f.write("end\n")
+        f.write("* xyz 0 2\n")
+        for symbol, x, y, z in geometry:
+            f.write(f"{symbol}    {x:.6f}    {y:.6f}    {z:.6f}\n")
+        f.write("*\n")
+
+
+def run_orca(orca_input_file, orca_output_file):
+    # 调用ORCA程序并等待其完成
+    result = subprocess.run(["orca", orca_input_file, ">", orca_output_file], shell=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ORCA Failed: {result.stderr}")
+
+def extract_single_point_energy(orca_output_file):
+    # 从ORCA输出文件中提取单点能
+    with open(orca_output_file, 'r') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        if "FINAL SINGLE POINT ENERGY" in line:
+            energy = float(line.split()[-1])
+            return energy
+
+    raise ValueError("Cannot extract single point energy from ORCA output file")
 
 if __name__ == '__main__':
+
+    # ----------------- Stage 1 TS generation -----------------
     radical_orig = read_gjf("Radical.gjf")
     sh = read_gjf("SH.gjf")
     gen_a_combination(sh, radical_orig, False)
     gen_a_combination(sh, radical_orig, True)
+    # xtb combined_0.mol --gbsa toluene --opt --input fixed.inp --uhf 1
+    xtb_result = subprocess.run(['xtb', 'combined_0.mol', '--gbsa', 'toluene', '--opt', '--input', 'fixed.inp', '--uhf', '1'], capture_output=True)
+    if xtb_result.returncode != 0:
+        print('Calculation failed')
+    else: # `mv xtbopt.mol pre_TS_0.mol`
+        print('Calculation succeeded')
+        subprocess.run(['mv', 'xtbopt.mol', 'pre_TS_0.mol'])
+    # xtb combined_1.mol --gbsa toluene --opt --input fixed.inp --uhf 1
+    xtb_result = subprocess.run(['xtb', 'combined_1.mol', '--gbsa', 'toluene', '--opt', '--input', 'fixed.inp', '--uhf', '1'], capture_output=True)
+    if xtb_result.returncode != 0:
+        print('Calculation failed')
+    else: # `mv xtbopt.mol pre_TS_1.mol`
+        print('Calculation succeeded')
+        subprocess.run(['mv', 'xtbopt.mol', 'pre_TS_1.mol'])
 
+    # ----------------- Stage 2 Converting as Guassian input files -----------------
+    mol_to_gaussian_input("pre_TS_0.mol", "TS_0.gjf")
+    mol_to_gaussian_input("pre_TS_1.mol", "TS_1.gjf")
+    print('The Gaussian input files are saved as TS_0.gjf and TS_1.gjf')
+
+    # ----------------- Stage 3 Running Gaussian and ORCA -----------------
+    run_gaussian("TS_0.gjf", "TS_0.log")
+    run_gaussian("TS_1.gjf", "TS_1.log")
+    gaussian_to_orca_input("TS_0.log", "TS_0.inp")
+    gaussian_to_orca_input("TS_1.log", "TS_1.inp")
+    run_orca("TS_0-orca.inp", "TS_0-orca.out")
+    run_orca("TS_1-orca.inp", "TS_1-orca.out")
+
+    # ----------------- Stage 4 Extracting single point energy -----------------
+    energy_0 = extract_single_point_energy("TS_0-orca.out")
+    energy_1 = extract_single_point_energy("TS_1-orca.out")
+    print('The single point energy of the first configuration is', energy_0)
+    print('The single point energy of the second configuration is', energy_1)
